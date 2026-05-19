@@ -50,6 +50,58 @@ PreRequest()
                  ──► [worker N]   read(BlockSize × BlockCount bytes)
 ```
 
+### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant EPP as EPP Router
+    participant Prefetch as PrefetchPrerequestHandler
+    participant PPC as PrecisePrefixCache Scorer
+    participant WQ as Work Queue
+    participant W0 as Worker 0
+    participant W1 as Worker 1..N
+    participant FS as Shared File System
+
+    Client->>EPP: Inference request
+    EPP->>EPP: Routing decision (scheduler)
+    EPP->>Prefetch: PreRequest(ctx, request, schedulingResult)
+
+    Prefetch->>PPC: GetEngineKeysForRequest(ctx, request)
+    PPC-->>Prefetch: []uint64 engineKeys
+
+    loop For each rank (0 … TpSize×PpSize×PcpSize-1)
+        Prefetch->>Prefetch: EngineKeysToFilePaths(rankParams, engineKeys)
+    end
+
+    alt queueTimeout > 0
+        loop For each file path
+            Prefetch->>WQ: send path (with timeout)
+            alt queue full within timeout
+                WQ-->>Prefetch: timeout — skip file
+            end
+        end
+    else queueTimeout == 0
+        loop For each file path
+            Prefetch->>WQ: send path (blocking)
+        end
+    end
+
+    EPP-->>Client: Request forwarded to GPU pod
+
+    par Worker pool (runs concurrently, independently of request path)
+        WQ->>W0: file path
+        W0->>FS: open + read(BlockSize × BlockCount bytes)
+        FS-->>W0: bytes (triggers storage tier promotion)
+        W0-->>WQ: ready for next item
+    and
+        WQ->>W1: file path
+        W1->>FS: open + read(BlockSize × BlockCount bytes)
+        FS-->>W1: bytes (triggers storage tier promotion)
+        W1-->>WQ: ready for next item
+    end
+```
+
 ## Configuration
 
 The plugin is registered as `prefetch-prerequest-handler` and configured via JSON
