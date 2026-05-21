@@ -3,10 +3,13 @@ package prefetch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,27 +26,51 @@ const (
 	PrefetchPrerequestHandlerType = "prefetch-prerequest-handler"
 )
 
-// EngineKeyToFilenamePathSuffix converts an engine-key (uint64 block hash) to
-// the path suffix used by llm-d-fs-connector: hhh/hh/<16hex>.bin.
-func EngineKeyToFilenamePathSuffix(engineKey uint64) string {
-	const mask64 = (1 << 64) - 1
-	blockHashHex := fmt.Sprintf("%016x", engineKey&mask64)
+// engineKeyToFilenamePathSuffix converts an engine-key (uint64 block hash) to
+// the path suffix used by llm-d-fs-connector: hhh/hh_g<groupIdx>/<16hex>.bin.
+func engineKeyToFilenamePathSuffix(engineKey uint64, groupIdx int) string {
+	blockHashHex := fmt.Sprintf("%016x", engineKey)
 	sub1, sub2 := blockHashHex[:3], blockHashHex[3:5]
-	return sub1 + "/" + sub2 + "/" + blockHashHex + ".bin"
+	return fmt.Sprintf("%s/%s_g%d/%s.bin", sub1, sub2, groupIdx, blockHashHex)
 }
 
-// KVFilePathBaseParams holds parameters to build the base path for KV-cache files.
+// KVFilePathBaseParams holds operator-supplied parameters for KV-cache file
+// paths. All fields are deserialized from the plugin's JSON config; this
+// struct does not hold runtime state. Discovery state lives on a separate
+// in-memory discoveryCache owned by the handler.
+//
+// On-disk layout written by vLLM (one identical filename per rank, with
+// different byte contents — each rank stores only its own KV shard):
+//
+//	<rootDir>/<safeModelName>_<12hex>_r<rank>/<hhh>/<hh>_g<groupIdx>/<hash>.bin
+//
+// The router cannot recompute the <12hex> digest because vLLM's hash inputs
+// (kv_cache_groups, layer_names, dtype, etc.) are not reliably reproducible.
+// Instead, discovery globs "<safeModelName>_*_r0" to anchor the shared
+// "<base>" prefix; per-rank paths are built by appending "_r<rank>" for each
+// rank in [0, Tp*Pp*Pcp*Dcp). _r0 is used purely as the glob anchor — it is
+// the only rank guaranteed to exist whenever any worker has flushed — and
+// the resulting <base> applies to all ranks because every worker shares the
+// same base_path (file_mapper.py:117).
 type KVFilePathBaseParams struct {
 	RootDir          string `json:"rootDir"`
-	ModelParentDir   string `json:"modelParentDir,omitempty"`
 	ModelName        string `json:"modelName"`
-	GpuBlockSize     int    `json:"gpuBlockSize"`
 	GpuBlocksPerFile int    `json:"gpuBlocksPerFile"`
 	TpSize           int    `json:"tpSize"`
 	PpSize           int    `json:"ppSize"`
 	PcpSize          int    `json:"pcpSize"`
-	Rank             int    `json:"rank"`
-	Dtype            string `json:"dtype"`
+	DcpSize          int    `json:"dcpSize"`
+}
+
+// discoveryCache memoizes the (base, groupIdx) pair resolved from globbing
+// the filesystem once per process. Populated lazily on the first PreRequest
+// and reset by invalidate() when a prefetch open hits os.ErrNotExist (vLLM
+// restarted with new hash inputs).
+type discoveryCache struct {
+	mu    sync.RWMutex
+	base  string // <rootDir>/<safeModelName>_<12hex>
+	group int    // typically 0
+	done  bool
 }
 
 // IsSet returns true if base path can be built.
@@ -53,9 +80,6 @@ func (b *KVFilePathBaseParams) IsSet() bool {
 
 // SetDefaults applies default values to unset KVFilePathBaseParams fields.
 func (b *KVFilePathBaseParams) SetDefaults() {
-	if b.GpuBlockSize < 1 {
-		b.GpuBlockSize = 64
-	}
 	if b.GpuBlocksPerFile < 1 {
 		b.GpuBlocksPerFile = 1
 	}
@@ -68,49 +92,170 @@ func (b *KVFilePathBaseParams) SetDefaults() {
 	if b.PcpSize < 1 {
 		b.PcpSize = 1
 	}
-}
-
-// BasePath returns the base directory path for KV-cache files.
-func (b *KVFilePathBaseParams) BasePath() string {
-	modelSegments := []string{b.RootDir}
-	if b.ModelParentDir != "" {
-		modelSegments = append(modelSegments, b.ModelParentDir)
+	if b.DcpSize < 1 {
+		b.DcpSize = 1
 	}
-	modelSegments = append(modelSegments, b.ModelName,
-		fmt.Sprintf("block_size_%d_blocks_per_file_%d", b.GpuBlockSize, b.GpuBlocksPerFile),
-		fmt.Sprintf("tp_%d_pp_size_%d_pcp_size_%d", b.TpSize, b.PpSize, b.PcpSize),
-		fmt.Sprintf("rank_%d", b.Rank),
-		b.Dtype)
-	return filepath.Join(modelSegments...)
 }
 
-// EngineKeyToFullPath returns the complete file path for an engine key.
-func EngineKeyToFullPath(base *KVFilePathBaseParams, engineKey uint64) string {
-	suffix := EngineKeyToFilenamePathSuffix(engineKey)
-	return filepath.Join(base.BasePath(), filepath.FromSlash(suffix))
+// discover resolves (base, group) by inspecting the filesystem. Idempotent
+// and safe to call concurrently — only the first caller actually scans
+// (RWMutex with double-check). On failure, returns an error and leaves the
+// cache unset; the caller skips this round and the next PreRequest will
+// retry.
+func (c *discoveryCache) discover(ctx context.Context, params *KVFilePathBaseParams) error {
+	c.mu.RLock()
+	if c.done {
+		c.mu.RUnlock()
+		return nil
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.done {
+		return nil
+	}
+
+	safeModelName := strings.ReplaceAll(params.ModelName, "/", "_")
+
+	// Glob "_r0" directories — rank 0 is guaranteed to exist whenever any
+	// worker has flushed, and every rank shares the same <base> prefix.
+	pattern := filepath.Join(params.RootDir, safeModelName+"_*_r0")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return fmt.Errorf("discover: glob %q: %w", pattern, err)
+	}
+	if len(matches) == 0 {
+		return fmt.Errorf("discover: no folder matches %q (has vLLM initialized and written any blocks?)", pattern)
+	}
+	if len(matches) > 1 {
+		return fmt.Errorf("discover: ambiguous — %d folders match %q: %v", len(matches), pattern, matches)
+	}
+	rank0 := matches[0]
+
+	// Find any "<hhh>/<hh>_g<N>" subfolder to learn the group index. We
+	// only need one sample — group_idx is the same for every block in a
+	// given vLLM deployment (single-group simplification, A3a).
+	groupIdx := -1
+	shards, err := os.ReadDir(rank0)
+	if err != nil {
+		return fmt.Errorf("discover: read %q: %w", rank0, err)
+	}
+	for _, shard := range shards {
+		if !shard.IsDir() {
+			continue
+		}
+		shardPath := filepath.Join(rank0, shard.Name())
+		groups, err := os.ReadDir(shardPath)
+		if err != nil {
+			continue
+		}
+		for _, g := range groups {
+			if !g.IsDir() {
+				continue
+			}
+			if idx := parseGroupSuffix(g.Name()); idx >= 0 {
+				groupIdx = idx
+				break
+			}
+		}
+		if groupIdx >= 0 {
+			break
+		}
+	}
+	if groupIdx < 0 {
+		return fmt.Errorf("discover: no \"<hh>_g<N>\" group subfolder found under %q (no blocks written yet?)", rank0)
+	}
+
+	c.base = strings.TrimSuffix(rank0, "_r0")
+	c.group = groupIdx
+	c.done = true
+
+	log.FromContext(ctx).Info("prefetch: resolved KV cache base path",
+		"rootDir", params.RootDir, "modelName", params.ModelName,
+		"basePath", c.base, "groupIdx", c.group)
+	return nil
 }
 
-// EngineKeysToFilePaths returns the file paths to prefetch for the given engine keys.
-func EngineKeysToFilePaths(base *KVFilePathBaseParams, engineKeys []uint64) []string {
-	n := base.GpuBlocksPerFile
+// parseGroupSuffix extracts N from "<prefix>_g<N>". Returns -1 on mismatch.
+func parseGroupSuffix(name string) int {
+	i := strings.LastIndex(name, "_g")
+	if i < 0 {
+		return -1
+	}
+	n, err := strconv.Atoi(name[i+2:])
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+// invalidate clears the discovery cache. Called when prefetch observes a
+// path no longer exists — vLLM may have restarted with new hash inputs,
+// shifting <base> to a new digest. Next PreRequest re-discovers.
+func (c *discoveryCache) invalidate() {
+	c.mu.Lock()
+	c.done = false
+	c.base = ""
+	c.group = 0
+	c.mu.Unlock()
+}
+
+// engineKeyToFullPath returns the complete file path for an engine key on
+// the given rank. The first call performs lazy discovery; on discovery
+// failure it logs at V(1) and returns ("", false) so the caller can skip
+// prefetch for this round.
+func (c *discoveryCache) engineKeyToFullPath(ctx context.Context, params *KVFilePathBaseParams, rank int, engineKey uint64) (string, bool) {
+	if err := c.discover(ctx, params); err != nil {
+		log.FromContext(ctx).V(1).Info("prefetch: discovery deferred", "reason", err.Error())
+		return "", false
+	}
+	c.mu.RLock()
+	base := c.base
+	group := c.group
+	c.mu.RUnlock()
+
+	suffix := engineKeyToFilenamePathSuffix(engineKey, group)
+	return fmt.Sprintf("%s_r%d/%s", base, rank, filepath.FromSlash(suffix)), true
+}
+
+// engineKeysToFilePaths returns the file paths to prefetch for the given
+// engine keys on the given rank. Returns nil if discovery hasn't succeeded
+// yet — the caller should skip this round entirely rather than emit partial
+// paths.
+func engineKeysToFilePaths(ctx context.Context, cache *discoveryCache, params *KVFilePathBaseParams, rank int, engineKeys []uint64) []string {
+	n := params.GpuBlocksPerFile
 	if n <= 1 {
-		paths := make([]string, len(engineKeys))
-		for i, ek := range engineKeys {
-			paths[i] = EngineKeyToFullPath(base, ek)
+		paths := make([]string, 0, len(engineKeys))
+		for _, ek := range engineKeys {
+			p, ok := cache.engineKeyToFullPath(ctx, params, rank, ek)
+			if !ok {
+				return nil
+			}
+			paths = append(paths, p)
 		}
 		return paths
 	}
 
 	paths := make([]string, 0, (len(engineKeys)+n-1)/n)
 	for i := n - 1; i < len(engineKeys); i += n {
-		paths = append(paths, EngineKeyToFullPath(base, engineKeys[i]))
+		p, ok := cache.engineKeyToFullPath(ctx, params, rank, engineKeys[i])
+		if !ok {
+			return nil
+		}
+		paths = append(paths, p)
 	}
 	return paths
 }
 
-func prefetchFile(ctx context.Context, filePath string, buffer []byte) error {
+func prefetchFile(ctx context.Context, filePath string, buffer []byte, cache *discoveryCache) error {
 	file, err := os.Open(filePath)
 	if err != nil {
+		// vLLM may have restarted with new hash inputs, shifting <base>
+		// to a new digest. Drop the cache so the next request re-discovers.
+		if cache != nil && errors.Is(err, os.ErrNotExist) {
+			cache.invalidate()
+		}
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
@@ -173,7 +318,7 @@ func initializeWorkerPool(ctx context.Context, handler *PrefetchPrerequestHandle
 					}
 
 					startTime := time.Now()
-					err := prefetchFile(pool.shutdownCtx, filePath, buffer)
+					err := prefetchFile(pool.shutdownCtx, filePath, buffer, handler.cache)
 					duration := time.Since(startTime)
 
 					if err != nil {
@@ -274,13 +419,17 @@ func PluginFactory(name string, rawParameters json.RawMessage, handle plugin.Han
 
 // NewPrefetchPrerequestHandler initializes a new PrefetchPrerequestHandler.
 func NewPrefetchPrerequestHandler(handle plugin.Handle, engineKeysProviderPluginName string, kvFilePathBase *KVFilePathBaseParams, prefetchConfig *PrefetchConfig) *PrefetchPrerequestHandler {
-	return &PrefetchPrerequestHandler{
+	h := &PrefetchPrerequestHandler{
 		typedName:                    plugin.TypedName{Type: PrefetchPrerequestHandlerType},
 		handle:                       handle,
 		engineKeysProviderPluginName: engineKeysProviderPluginName,
 		kvFilePathBase:               kvFilePathBase,
 		prefetchConfig:               prefetchConfig,
 	}
+	if kvFilePathBase != nil {
+		h.cache = &discoveryCache{}
+	}
+	return h
 }
 
 // PrefetchPrerequestHandler is a PreRequest plugin.
@@ -289,6 +438,7 @@ type PrefetchPrerequestHandler struct {
 	handle                       plugin.Handle
 	engineKeysProviderPluginName string
 	kvFilePathBase               *KVFilePathBaseParams
+	cache                        *discoveryCache
 	prefetchConfig               *PrefetchConfig
 	workerPool                   *PrefetchWorkerPool
 }
@@ -351,24 +501,23 @@ func (p *PrefetchPrerequestHandler) PreRequest(ctx context.Context, request *sch
 					return
 				}
 
-				filenames := make([]string, len(validEngineKeys))
-				for i, ek := range validEngineKeys {
-					filenames[i] = EngineKeyToFilenamePathSuffix(ek)
-				}
-				log.FromContext(ctx).Info("PreRequest: engine-keys and filenames for request",
+				log.FromContext(ctx).Info("PreRequest: engine-keys for request",
 					"requestId", request.RequestID, "provider", p.engineKeysProviderPluginName,
-					"engineKeys", validEngineKeys, "filenames", filenames)
+					"engineKeys", validEngineKeys)
 
 				if p.kvFilePathBase != nil && p.kvFilePathBase.IsSet() {
 					base := p.kvFilePathBase
-					totalRanks := base.TpSize * base.PpSize * base.PcpSize
+					totalRanks := base.TpSize * base.PpSize * base.PcpSize * base.DcpSize
 					filesPerRank := (len(validEngineKeys) + base.GpuBlocksPerFile - 1) / base.GpuBlocksPerFile
 					allFilePaths := make([]string, 0, filesPerRank*totalRanks)
 
 					for rank := 0; rank < totalRanks; rank++ {
-						rankParams := *base
-						rankParams.Rank = rank
-						fullPaths := EngineKeysToFilePaths(&rankParams, validEngineKeys)
+						fullPaths := engineKeysToFilePaths(ctx, p.cache, base, rank, validEngineKeys)
+						if fullPaths == nil {
+							log.FromContext(ctx).V(1).Info("PreRequest: skipping request — KV cache base path not yet discovered",
+								"requestId", request.RequestID)
+							return
+						}
 						allFilePaths = append(allFilePaths, fullPaths...)
 						log.FromContext(ctx).Info("PreRequest: KV-cache file paths for rank",
 							"requestId", request.RequestID, "rank", rank,

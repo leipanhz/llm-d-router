@@ -32,33 +32,44 @@ func TestEngineKeyToFilenamePathSuffix(t *testing.T) {
 	tests := []struct {
 		name      string
 		engineKey uint64
+		groupIdx  int
 		expected  string
 	}{
 		{
 			name:      "zero key",
 			engineKey: 0,
-			expected:  "000/00/0000000000000000.bin",
+			groupIdx:  0,
+			expected:  "000/00_g0/0000000000000000.bin",
 		},
 		{
 			name:      "small key",
 			engineKey: 0x123,
-			expected:  "000/00/0000000000000123.bin",
+			groupIdx:  0,
+			expected:  "000/00_g0/0000000000000123.bin",
 		},
 		{
 			name:      "large key",
 			engineKey: 0xABCDEF1234567890,
-			expected:  "abc/de/abcdef1234567890.bin",
+			groupIdx:  0,
+			expected:  "abc/de_g0/abcdef1234567890.bin",
 		},
 		{
 			name:      "max uint64",
 			engineKey: 0xFFFFFFFFFFFFFFFF,
-			expected:  "fff/ff/ffffffffffffffff.bin",
+			groupIdx:  0,
+			expected:  "fff/ff_g0/ffffffffffffffff.bin",
+		},
+		{
+			name:      "non-zero group idx",
+			engineKey: 0xABCDEF1234567890,
+			groupIdx:  3,
+			expected:  "abc/de_g3/abcdef1234567890.bin",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EngineKeyToFilenamePathSuffix(tt.engineKey)
+			result := engineKeyToFilenamePathSuffix(tt.engineKey, tt.groupIdx)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -122,42 +133,41 @@ func TestKVFilePathBaseParams_SetDefaults(t *testing.T) {
 			name:   "all defaults",
 			params: &KVFilePathBaseParams{},
 			expected: &KVFilePathBaseParams{
-				GpuBlockSize:     64,
 				GpuBlocksPerFile: 1,
 				TpSize:           1,
 				PpSize:           1,
 				PcpSize:          1,
+				DcpSize:          1,
 			},
 		},
 		{
 			name: "partial defaults",
 			params: &KVFilePathBaseParams{
-				GpuBlockSize: 128,
-				TpSize:       4,
+				TpSize: 4,
 			},
 			expected: &KVFilePathBaseParams{
-				GpuBlockSize:     128,
 				GpuBlocksPerFile: 1,
 				TpSize:           4,
 				PpSize:           1,
 				PcpSize:          1,
+				DcpSize:          1,
 			},
 		},
 		{
 			name: "no defaults needed",
 			params: &KVFilePathBaseParams{
-				GpuBlockSize:     256,
 				GpuBlocksPerFile: 8,
 				TpSize:           2,
 				PpSize:           2,
 				PcpSize:          2,
+				DcpSize:          2,
 			},
 			expected: &KVFilePathBaseParams{
-				GpuBlockSize:     256,
 				GpuBlocksPerFile: 8,
 				TpSize:           2,
 				PpSize:           2,
 				PcpSize:          2,
+				DcpSize:          2,
 			},
 		},
 	}
@@ -166,138 +176,6 @@ func TestKVFilePathBaseParams_SetDefaults(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.params.SetDefaults()
 			assert.Equal(t, tt.expected, tt.params)
-		})
-	}
-}
-
-func TestKVFilePathBaseParams_BasePath(t *testing.T) {
-	tests := []struct {
-		name     string
-		params   *KVFilePathBaseParams
-		expected string
-	}{
-		{
-			name: "basic path",
-			params: &KVFilePathBaseParams{
-				RootDir:          "/data",
-				ModelName:        "llama-7b",
-				GpuBlockSize:     64,
-				GpuBlocksPerFile: 1,
-				TpSize:           1,
-				PpSize:           1,
-				PcpSize:          1,
-				Rank:             0,
-				Dtype:            "float16",
-			},
-			expected: filepath.Join("/data", "llama-7b", "block_size_64_blocks_per_file_1", "tp_1_pp_size_1_pcp_size_1", "rank_0", "float16"),
-		},
-		{
-			name: "with model parent dir",
-			params: &KVFilePathBaseParams{
-				RootDir:          "/data",
-				ModelParentDir:   "models",
-				ModelName:        "llama-7b",
-				GpuBlockSize:     128,
-				GpuBlocksPerFile: 4,
-				TpSize:           2,
-				PpSize:           2,
-				PcpSize:          1,
-				Rank:             3,
-				Dtype:            "bfloat16",
-			},
-			expected: filepath.Join("/data", "models", "llama-7b", "block_size_128_blocks_per_file_4", "tp_2_pp_size_2_pcp_size_1", "rank_3", "bfloat16"),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := tt.params.BasePath()
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-func TestEngineKeyToFullPath(t *testing.T) {
-	base := &KVFilePathBaseParams{
-		RootDir:          "/data",
-		ModelName:        "test-model",
-		GpuBlockSize:     64,
-		GpuBlocksPerFile: 1,
-		TpSize:           1,
-		PpSize:           1,
-		PcpSize:          1,
-		Rank:             0,
-		Dtype:            "float16",
-	}
-
-	engineKey := uint64(0x123456789ABCDEF0)
-	expected := filepath.Join("/data", "test-model", "block_size_64_blocks_per_file_1", "tp_1_pp_size_1_pcp_size_1", "rank_0", "float16", "123", "45", "123456789abcdef0.bin")
-
-	result := EngineKeyToFullPath(base, engineKey)
-	assert.Equal(t, expected, result)
-}
-
-func TestEngineKeysToFilePaths(t *testing.T) {
-	tests := []struct {
-		name       string
-		base       *KVFilePathBaseParams
-		engineKeys []uint64
-		expected   int // expected number of paths
-	}{
-		{
-			name: "single block per file",
-			base: &KVFilePathBaseParams{
-				RootDir:          "/data",
-				ModelName:        "test",
-				GpuBlockSize:     64,
-				GpuBlocksPerFile: 1,
-				TpSize:           1,
-				PpSize:           1,
-				PcpSize:          1,
-				Rank:             0,
-				Dtype:            "float16",
-			},
-			engineKeys: []uint64{0x1, 0x2, 0x3, 0x4},
-			expected:   4,
-		},
-		{
-			name: "multiple blocks per file",
-			base: &KVFilePathBaseParams{
-				RootDir:          "/data",
-				ModelName:        "test",
-				GpuBlockSize:     64,
-				GpuBlocksPerFile: 2,
-				TpSize:           1,
-				PpSize:           1,
-				PcpSize:          1,
-				Rank:             0,
-				Dtype:            "float16",
-			},
-			engineKeys: []uint64{0x1, 0x2, 0x3, 0x4},
-			expected:   2,
-		},
-		{
-			name: "multiple blocks per file with remainder",
-			base: &KVFilePathBaseParams{
-				RootDir:          "/data",
-				ModelName:        "test",
-				GpuBlockSize:     64,
-				GpuBlocksPerFile: 3,
-				TpSize:           1,
-				PpSize:           1,
-				PcpSize:          1,
-				Rank:             0,
-				Dtype:            "float16",
-			},
-			engineKeys: []uint64{0x1, 0x2, 0x3, 0x4, 0x5},
-			expected:   1,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := EngineKeysToFilePaths(tt.base, tt.engineKeys)
-			assert.Equal(t, tt.expected, len(result))
 		})
 	}
 }
@@ -394,7 +272,7 @@ func TestPrefetchFile(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			buffer := make([]byte, tt.bufferLen)
-			err := prefetchFile(ctx, tt.filePath, buffer)
+			err := prefetchFile(ctx, tt.filePath, buffer, nil)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
