@@ -244,22 +244,37 @@ func (c *discoveryCache) digestToFullPath(rank int, digest []byte) string {
 }
 
 // digestsToFilePaths returns the file paths to prefetch for the given
-// block-hash digests on the given rank. The first digest is used as the
-// discovery anchor on the first call; once cached, every subsequent path
-// is built directly from the cached prefix. Returns nil if discovery
-// fails — the caller should skip this round entirely rather than emit
-// partial paths.
+// block-hash digests on the given rank. The fs-connector aggregates
+// GpuBlocksPerFile vLLM blocks into one on-disk file, naming it after
+// the last block's hash — so when n>1, only digests at indices n-1,
+// 2n-1, 3n-1, ... actually correspond to files on disk. Discovery uses
+// the first such index as its anchor; if there are fewer than n
+// digests, no file is yet persisted for this request and discovery is
+// skipped (returns nil so the caller skips this round).
+//
+// Returns nil if discovery fails — the caller should skip this round
+// entirely rather than emit partial paths.
 func digestsToFilePaths(ctx context.Context, cache *discoveryCache, params *KVFilePathBaseParams, rank int, digests [][]byte) []string {
 	if len(digests) == 0 {
 		return nil
 	}
-	if err := cache.discover(ctx, params, digests[0]); err != nil {
+	n := params.GpuBlocksPerFile
+	if n < 1 {
+		n = 1
+	}
+	if len(digests) < n {
+		// No aggregated file has been written for this request yet.
+		return nil
+	}
+
+	// Anchor on the first persistable file (index n-1). For n=1 this is
+	// digests[0] — preserves single-block behaviour.
+	if err := cache.discover(ctx, params, digests[n-1]); err != nil {
 		log.FromContext(ctx).V(1).Info("prefetch: discovery deferred", "reason", err.Error())
 		return nil
 	}
 
-	n := params.GpuBlocksPerFile
-	if n <= 1 {
+	if n == 1 {
 		paths := make([]string, 0, len(digests))
 		for _, d := range digests {
 			paths = append(paths, cache.digestToFullPath(rank, d))
@@ -267,7 +282,7 @@ func digestsToFilePaths(ctx context.Context, cache *discoveryCache, params *KVFi
 		return paths
 	}
 
-	paths := make([]string, 0, (len(digests)+n-1)/n)
+	paths := make([]string, 0, len(digests)/n)
 	for i := n - 1; i < len(digests); i += n {
 		paths = append(paths, cache.digestToFullPath(rank, digests[i]))
 	}

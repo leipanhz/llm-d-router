@@ -178,9 +178,19 @@ func TestParseGroupSuffix(t *testing.T) {
 
 func TestDigestsToFilePaths_BatchedByBlocksPerFile(t *testing.T) {
 	root := t.TempDir()
-	// Anchor digest: the first one in the request triggers discovery.
-	anchorHex := "0000000000000001000000000000000000000000000000000000000000000001"
-	anchor := writeAnchorFile(t, root, "m", "abcdef123456", 0, 0, anchorHex)
+
+	digestN := func(n byte) []byte {
+		d := make([]byte, 32)
+		d[31] = n
+		return d
+	}
+
+	// fs-connector aggregates 4 vLLM blocks per file and names each
+	// file after the last block. With 8 digests and GpuBlocksPerFile=4,
+	// vLLM persists files at digests[3] and digests[7]. Discovery
+	// anchors on digests[3] (the first persistable index).
+	anchorHex := hex.EncodeToString(digestN(4))
+	writeAnchorFile(t, root, "m", "abcdef123456", 0, 0, anchorHex)
 
 	params := &KVFilePathBaseParams{
 		RootDir:          root,
@@ -189,21 +199,34 @@ func TestDigestsToFilePaths_BatchedByBlocksPerFile(t *testing.T) {
 	}
 	cache := &discoveryCache{}
 
-	// 8 digests starting with the anchor; the batching loop with
-	// GpuBlocksPerFile=4 picks indices 3 and 7.
-	digestN := func(n byte) []byte {
-		d := make([]byte, 32)
-		d[31] = n
-		return d
-	}
 	digests := [][]byte{
-		anchor, digestN(2), digestN(3), digestN(4),
+		digestN(1), digestN(2), digestN(3), digestN(4),
 		digestN(5), digestN(6), digestN(7), digestN(8),
 	}
 	paths := digestsToFilePaths(context.Background(), cache, params, 0, digests)
 	require.Len(t, paths, 2)
 	assert.Contains(t, paths[0], hex.EncodeToString(digestN(4))+".bin")
 	assert.Contains(t, paths[1], hex.EncodeToString(digestN(8))+".bin")
+}
+
+func TestDigestsToFilePaths_FewerDigestsThanBlocksPerFile(t *testing.T) {
+	root := t.TempDir()
+	// vLLM hasn't aggregated enough blocks to write any file yet, so
+	// discovery must defer and the helper returns nil.
+	params := &KVFilePathBaseParams{
+		RootDir:          root,
+		ModelName:        "m",
+		GpuBlocksPerFile: 8,
+	}
+	cache := &discoveryCache{}
+	digests := make([][]byte, 7) // 7 < 8
+	for i := range digests {
+		d := make([]byte, 32)
+		d[31] = byte(i + 1)
+		digests[i] = d
+	}
+	paths := digestsToFilePaths(context.Background(), cache, params, 0, digests)
+	assert.Nil(t, paths)
 }
 
 func TestDigestsToFilePaths_DiscoveryDefersReturnsNil(t *testing.T) {
