@@ -2,6 +2,7 @@ package prefetch
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,12 +27,16 @@ const (
 	PrefetchPrerequestHandlerType = "prefetch-prerequest-handler"
 )
 
-// engineKeyToFilenamePathSuffix converts an engine-key (uint64 block hash) to
-// the path suffix used by llm-d-fs-connector: hhh/hh_g<groupIdx>/<16hex>.bin.
-func engineKeyToFilenamePathSuffix(engineKey uint64, groupIdx int) string {
-	blockHashHex := fmt.Sprintf("%016x", engineKey)
-	sub1, sub2 := blockHashHex[:3], blockHashHex[3:5]
-	return fmt.Sprintf("%s/%s_g%d/%s.bin", sub1, sub2, groupIdx, blockHashHex)
+// digestToFilenamePathSuffix converts a full-width block-hash digest to the
+// path suffix used by llm-d-fs-connector: <hhh>/<hh>_g<groupIdx>/<hex>.bin.
+// The digest width matches the upstream prefix-caching hash algo: 32 bytes
+// for sha256_cbor (vLLM ≥ v0.10.2 → 64 hex chars on disk) or 8 bytes for
+// fnv64a (16 hex chars). The hash bytes name the leaf and the <hhh>/<hh>
+// subfolders; group_idx lives in the parent folder name.
+func digestToFilenamePathSuffix(digest []byte, groupIdx int) string {
+	hashHex := hex.EncodeToString(digest)
+	sub1, sub2 := hashHex[:3], hashHex[3:5]
+	return fmt.Sprintf("%s/%s_g%d/%s.bin", sub1, sub2, groupIdx, hashHex)
 }
 
 // KVFilePathBaseParams holds operator-supplied parameters for KV-cache file
@@ -201,11 +206,11 @@ func (c *discoveryCache) invalidate() {
 	c.mu.Unlock()
 }
 
-// engineKeyToFullPath returns the complete file path for an engine key on
+// digestToFullPath returns the complete file path for a block-hash digest on
 // the given rank. The first call performs lazy discovery; on discovery
 // failure it logs at V(1) and returns ("", false) so the caller can skip
 // prefetch for this round.
-func (c *discoveryCache) engineKeyToFullPath(ctx context.Context, params *KVFilePathBaseParams, rank int, engineKey uint64) (string, bool) {
+func (c *discoveryCache) digestToFullPath(ctx context.Context, params *KVFilePathBaseParams, rank int, digest []byte) (string, bool) {
 	if err := c.discover(ctx, params); err != nil {
 		log.FromContext(ctx).V(1).Info("prefetch: discovery deferred", "reason", err.Error())
 		return "", false
@@ -215,20 +220,20 @@ func (c *discoveryCache) engineKeyToFullPath(ctx context.Context, params *KVFile
 	group := c.group
 	c.mu.RUnlock()
 
-	suffix := engineKeyToFilenamePathSuffix(engineKey, group)
+	suffix := digestToFilenamePathSuffix(digest, group)
 	return fmt.Sprintf("%s_r%d/%s", base, rank, filepath.FromSlash(suffix)), true
 }
 
-// engineKeysToFilePaths returns the file paths to prefetch for the given
-// engine keys on the given rank. Returns nil if discovery hasn't succeeded
-// yet — the caller should skip this round entirely rather than emit partial
-// paths.
-func engineKeysToFilePaths(ctx context.Context, cache *discoveryCache, params *KVFilePathBaseParams, rank int, engineKeys []uint64) []string {
+// digestsToFilePaths returns the file paths to prefetch for the given
+// block-hash digests on the given rank. Returns nil if discovery hasn't
+// succeeded yet — the caller should skip this round entirely rather than
+// emit partial paths.
+func digestsToFilePaths(ctx context.Context, cache *discoveryCache, params *KVFilePathBaseParams, rank int, digests [][]byte) []string {
 	n := params.GpuBlocksPerFile
 	if n <= 1 {
-		paths := make([]string, 0, len(engineKeys))
-		for _, ek := range engineKeys {
-			p, ok := cache.engineKeyToFullPath(ctx, params, rank, ek)
+		paths := make([]string, 0, len(digests))
+		for _, d := range digests {
+			p, ok := cache.digestToFullPath(ctx, params, rank, d)
 			if !ok {
 				return nil
 			}
@@ -237,9 +242,9 @@ func engineKeysToFilePaths(ctx context.Context, cache *discoveryCache, params *K
 		return paths
 	}
 
-	paths := make([]string, 0, (len(engineKeys)+n-1)/n)
-	for i := n - 1; i < len(engineKeys); i += n {
-		p, ok := cache.engineKeyToFullPath(ctx, params, rank, engineKeys[i])
+	paths := make([]string, 0, (len(digests)+n-1)/n)
+	for i := n - 1; i < len(digests); i += n {
+		p, ok := cache.digestToFullPath(ctx, params, rank, digests[i])
 		if !ok {
 			return nil
 		}
@@ -472,47 +477,29 @@ func (p *PrefetchPrerequestHandler) PreRequest(ctx context.Context, request *sch
 				log.FromContext(ctx).Info("PreRequest: accessing engine-keys from provider",
 					"requestId", request.RequestID, "provider", p.engineKeysProviderPluginName)
 
-				engineKeys, err := keysProvider.GetEngineKeysForRequest(ctx, request)
+				_, digests, err := keysProvider.GetEngineKeysAndDigestsForRequest(ctx, request)
 				if err != nil {
-					log.FromContext(ctx).Error(err, "PreRequest: GetEngineKeysForRequest failed",
+					log.FromContext(ctx).Error(err, "PreRequest: GetEngineKeysAndDigestsForRequest failed",
 						"requestId", request.RequestID, "provider", p.engineKeysProviderPluginName)
 					return
 				}
 
-				if len(engineKeys) == 0 {
+				if len(digests) == 0 {
 					return
 				}
 
-				validEngineKeys := make([]uint64, 0, len(engineKeys))
-				for _, ek := range engineKeys {
-					if ek != 0 {
-						validEngineKeys = append(validEngineKeys, ek)
-					}
-				}
-
-				if emptyCount := len(engineKeys) - len(validEngineKeys); emptyCount > 0 {
-					log.FromContext(ctx).Info("PreRequest: empty engine keys (0) received",
-						"requestId", request.RequestID, "provider", p.engineKeysProviderPluginName,
-						"emptyCount", emptyCount, "totalEngineKeys", len(engineKeys))
-				}
-				if len(validEngineKeys) == 0 {
-					log.FromContext(ctx).Info("PreRequest: all engine-keys are 0 (no requestKey→engineKey mapping); skipping paths",
-						"requestId", request.RequestID, "provider", p.engineKeysProviderPluginName)
-					return
-				}
-
-				log.FromContext(ctx).Info("PreRequest: engine-keys for request",
+				log.FromContext(ctx).Info("PreRequest: digests for request",
 					"requestId", request.RequestID, "provider", p.engineKeysProviderPluginName,
-					"engineKeys", validEngineKeys)
+					"digestCount", len(digests))
 
 				if p.kvFilePathBase != nil && p.kvFilePathBase.IsSet() {
 					base := p.kvFilePathBase
 					totalRanks := base.TpSize * base.PpSize * base.PcpSize * base.DcpSize
-					filesPerRank := (len(validEngineKeys) + base.GpuBlocksPerFile - 1) / base.GpuBlocksPerFile
+					filesPerRank := (len(digests) + base.GpuBlocksPerFile - 1) / base.GpuBlocksPerFile
 					allFilePaths := make([]string, 0, filesPerRank*totalRanks)
 
 					for rank := 0; rank < totalRanks; rank++ {
-						fullPaths := engineKeysToFilePaths(ctx, p.cache, base, rank, validEngineKeys)
+						fullPaths := digestsToFilePaths(ctx, p.cache, base, rank, digests)
 						if fullPaths == nil {
 							log.FromContext(ctx).V(1).Info("PreRequest: skipping request — KV cache base path not yet discovered",
 								"requestId", request.RequestID)

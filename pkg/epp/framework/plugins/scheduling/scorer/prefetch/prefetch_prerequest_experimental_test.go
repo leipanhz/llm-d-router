@@ -18,6 +18,7 @@ package prefetch
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -28,48 +29,79 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestEngineKeyToFilenamePathSuffix(t *testing.T) {
+func TestDigestToFilenamePathSuffix(t *testing.T) {
+	// Build a 32-byte digest with the trailing 8 bytes set to a known
+	// uint64 (matching the SHA256 layout), and the leading bytes set to a
+	// distinguishable prefix used for <hhh>/<hh>.
+	digestSHA256 := func(prefix []byte, tail uint64) []byte {
+		d := make([]byte, 32)
+		copy(d, prefix)
+		for i := 0; i < 8; i++ {
+			d[24+i] = byte(tail >> (8 * (7 - i)))
+		}
+		return d
+	}
+
+	digestFNV := func(v uint64) []byte {
+		d := make([]byte, 8)
+		for i := 0; i < 8; i++ {
+			d[i] = byte(v >> (8 * (7 - i)))
+		}
+		return d
+	}
+
 	tests := []struct {
-		name      string
-		engineKey uint64
-		groupIdx  int
-		expected  string
+		name     string
+		digest   []byte
+		groupIdx int
+		expected string
 	}{
 		{
-			name:      "zero key",
-			engineKey: 0,
-			groupIdx:  0,
-			expected:  "000/00_g0/0000000000000000.bin",
+			name:     "fnv 8-byte zero key",
+			digest:   digestFNV(0),
+			groupIdx: 0,
+			expected: "000/00_g0/0000000000000000.bin",
 		},
 		{
-			name:      "small key",
-			engineKey: 0x123,
-			groupIdx:  0,
-			expected:  "000/00_g0/0000000000000123.bin",
+			name:     "fnv 8-byte small key",
+			digest:   digestFNV(0x123),
+			groupIdx: 0,
+			expected: "000/00_g0/0000000000000123.bin",
 		},
 		{
-			name:      "large key",
-			engineKey: 0xABCDEF1234567890,
-			groupIdx:  0,
-			expected:  "abc/de_g0/abcdef1234567890.bin",
+			name:     "fnv 8-byte large key",
+			digest:   digestFNV(0xABCDEF1234567890),
+			groupIdx: 0,
+			expected: "abc/de_g0/abcdef1234567890.bin",
 		},
 		{
-			name:      "max uint64",
-			engineKey: 0xFFFFFFFFFFFFFFFF,
-			groupIdx:  0,
-			expected:  "fff/ff_g0/ffffffffffffffff.bin",
+			name:     "fnv 8-byte non-zero group",
+			digest:   digestFNV(0xABCDEF1234567890),
+			groupIdx: 3,
+			expected: "abc/de_g3/abcdef1234567890.bin",
 		},
 		{
-			name:      "non-zero group idx",
-			engineKey: 0xABCDEF1234567890,
-			groupIdx:  3,
-			expected:  "abc/de_g3/abcdef1234567890.bin",
+			name: "sha256 32-byte digest uses leading bytes",
+			// Real on-disk example: digest 7050ab3d…d04d5d1; <hhh>=705,
+			// <hh>=0a; trailing 8 bytes shouldn't influence the path.
+			digest: func() []byte {
+				d, _ := hex.DecodeString("7050ab3d42d0b5e628c4e846e90715c1e1b2ac6247ce88b5e1a944b73c04d5d1")
+				return d
+			}(),
+			groupIdx: 0,
+			expected: "705/0a_g0/7050ab3d42d0b5e628c4e846e90715c1e1b2ac6247ce88b5e1a944b73c04d5d1.bin",
+		},
+		{
+			name:     "sha256 32-byte with non-zero group",
+			digest:   digestSHA256([]byte{0xab, 0xcd, 0xef}, 0x1234567890ABCDEF),
+			groupIdx: 7,
+			expected: "abc/de_g7/abcdef0000000000000000000000000000000000000000001234567890abcdef.bin",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := engineKeyToFilenamePathSuffix(tt.engineKey, tt.groupIdx)
+			result := digestToFilenamePathSuffix(tt.digest, tt.groupIdx)
 			assert.Equal(t, tt.expected, result)
 		})
 	}

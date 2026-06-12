@@ -122,7 +122,7 @@ func TestDiscover_GroupIdxNonZero(t *testing.T) {
 	assert.Equal(t, 3, cache.group)
 }
 
-func TestEngineKeyToFullPath_FormatsCorrectly(t *testing.T) {
+func TestDigestToFullPath_FormatsCorrectly(t *testing.T) {
 	root := t.TempDir()
 	makeRank0Tree(t, root, "m", "abc", "abc", "ab", 0)
 
@@ -133,15 +133,16 @@ func TestEngineKeyToFullPath_FormatsCorrectly(t *testing.T) {
 	cache := &discoveryCache{}
 	require.NoError(t, cache.discover(context.Background(), params))
 
-	// 0xdeadbeef00000000 → hex "deadbeef00000000"; sub1="dea", sub2="db"
-	path, ok := cache.engineKeyToFullPath(context.Background(), params, 2, 0xdeadbeef00000000)
+	// 8-byte digest 0xdeadbeef00000000 → hex "deadbeef00000000"; sub1="dea", sub2="db"
+	digest := []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00}
+	path, ok := cache.digestToFullPath(context.Background(), params, 2, digest)
 	assert.True(t, ok)
 	expectedBase := filepath.Join(root, "m_abc")
 	expected := fmt.Sprintf("%s_r2/dea/db_g0/deadbeef00000000.bin", expectedBase)
 	assert.Equal(t, expected, path)
 }
 
-func TestEngineKeyToFullPath_DiscoveryDefers(t *testing.T) {
+func TestDigestToFullPath_DiscoveryDefers(t *testing.T) {
 	root := t.TempDir()
 	// No vLLM tree under root → discovery fails.
 	params := &KVFilePathBaseParams{
@@ -149,7 +150,7 @@ func TestEngineKeyToFullPath_DiscoveryDefers(t *testing.T) {
 		ModelName: "no-such-model",
 	}
 	cache := &discoveryCache{}
-	path, ok := cache.engineKeyToFullPath(context.Background(), params, 0, 0x1)
+	path, ok := cache.digestToFullPath(context.Background(), params, 0, []byte{0x01})
 	assert.False(t, ok)
 	assert.Equal(t, "", path)
 }
@@ -202,7 +203,7 @@ func TestParseGroupSuffix(t *testing.T) {
 	}
 }
 
-func TestEngineKeysToFilePaths_BatchedByBlocksPerFile(t *testing.T) {
+func TestDigestsToFilePaths_BatchedByBlocksPerFile(t *testing.T) {
 	root := t.TempDir()
 	makeRank0Tree(t, root, "m", "abc", "abc", "ab", 0)
 
@@ -212,16 +213,26 @@ func TestEngineKeysToFilePaths_BatchedByBlocksPerFile(t *testing.T) {
 		GpuBlocksPerFile: 4,
 	}
 	cache := &discoveryCache{}
-	keys := []uint64{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8}
-	paths := engineKeysToFilePaths(context.Background(), cache, params, 0, keys)
+	digestFor := func(v uint64) []byte {
+		d := make([]byte, 8)
+		for i := 0; i < 8; i++ {
+			d[i] = byte(v >> (8 * (7 - i)))
+		}
+		return d
+	}
+	digests := [][]byte{
+		digestFor(0x1), digestFor(0x2), digestFor(0x3), digestFor(0x4),
+		digestFor(0x5), digestFor(0x6), digestFor(0x7), digestFor(0x8),
+	}
+	paths := digestsToFilePaths(context.Background(), cache, params, 0, digests)
 	require.Len(t, paths, 2)
 	// With GpuBlocksPerFile=4, the loop picks indices 3 and 7
-	// (zero-based), i.e. keys 0x4 and 0x8.
+	// (zero-based), i.e. digests 0x4 and 0x8.
 	assert.Contains(t, paths[0], "0000000000000004.bin")
 	assert.Contains(t, paths[1], "0000000000000008.bin")
 }
 
-func TestEngineKeysToFilePaths_DiscoveryDefersReturnsNil(t *testing.T) {
+func TestDigestsToFilePaths_DiscoveryDefersReturnsNil(t *testing.T) {
 	root := t.TempDir()
 	params := &KVFilePathBaseParams{
 		RootDir:          root,
@@ -229,6 +240,7 @@ func TestEngineKeysToFilePaths_DiscoveryDefersReturnsNil(t *testing.T) {
 		GpuBlocksPerFile: 1,
 	}
 	cache := &discoveryCache{}
-	paths := engineKeysToFilePaths(context.Background(), cache, params, 0, []uint64{0x1, 0x2})
+	paths := digestsToFilePaths(context.Background(), cache, params, 0,
+		[][]byte{{0, 0, 0, 0, 0, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 2}})
 	assert.Nil(t, paths)
 }

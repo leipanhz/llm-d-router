@@ -696,13 +696,23 @@ func (s *Scorer) ensureSubscribersForEndpoints(ctx context.Context, endpoints []
 
 func (s *Scorer) GetEngineKeysForRequest(ctx context.Context,
 	request *scheduling.InferenceRequest) ([]uint64, error) {
+	engineKeys, _, err := s.GetEngineKeysAndDigestsForRequest(ctx, request)
+	return engineKeys, err
+}
+
+// GetEngineKeysAndDigestsForRequest returns the per-block uint64 engine keys
+// (used for index lookup and wire compatibility) alongside the full-width hash
+// digests (used by the prefetch plugin to build vLLM fs-connector filenames —
+// 32 hex chars for SHA256-CBOR, 16 hex chars for FNV).
+func (s *Scorer) GetEngineKeysAndDigestsForRequest(ctx context.Context,
+	request *scheduling.InferenceRequest) ([]uint64, [][]byte, error) {
 	if request == nil || request.Body == nil || request.Body.TokenizedPrompt == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	tp := request.Body.TokenizedPrompt
 	if len(tp.TokenIDs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var extraFeatures []*kvblock.BlockExtraFeatures
@@ -717,20 +727,21 @@ func (s *Scorer) GetEngineKeysForRequest(ctx context.Context,
 		var err error
 		processor, err = kvblock.NewChunkedTokenDatabase(s.tokenProcessorConfig)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create token processor for engine keys: %w", err)
+			return nil, nil, fmt.Errorf("failed to create token processor for engine keys: %w", err)
 		}
 	}
 
-	blockKeys, err := processor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tp.TokenIDs, request.TargetModel, extraFeatures)
+	blockKeys, digests, err := processor.TokensToKVBlockKeysWithDigests(
+		kvblock.EmptyBlockHash, tp.TokenIDs, request.TargetModel, extraFeatures)
 	if err != nil {
-		return nil, fmt.Errorf("failed to compute engine keys: %w", err)
+		return nil, nil, fmt.Errorf("failed to compute engine keys: %w", err)
 	}
 
 	engineKeys := make([]uint64, 0, len(blockKeys))
 	for _, blockKey := range blockKeys {
 		engineKeys = append(engineKeys, uint64(blockKey))
 	}
-	return engineKeys, nil
+	return engineKeys, digests, nil
 }
 
 // --- Internal helper methods ---
