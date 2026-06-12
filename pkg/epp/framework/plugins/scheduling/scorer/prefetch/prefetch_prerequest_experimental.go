@@ -47,16 +47,14 @@ func digestToFilenamePathSuffix(digest []byte, groupIdx int) string {
 // On-disk layout written by vLLM (one identical filename per rank, with
 // different byte contents — each rank stores only its own KV shard):
 //
-//	<rootDir>/<safeModelName>_<12hex>_r<rank>/<hhh>/<hh>_g<groupIdx>/<hash>.bin
+//	<rootDir>/<modelDir>_r<rank>/<hhh>/<hh>_g<groupIdx>/<hash>.bin
 //
-// The router cannot recompute the <12hex> digest because vLLM's hash inputs
-// (kv_cache_groups, layer_names, dtype, etc.) are not reliably reproducible.
-// Instead, discovery globs "<safeModelName>_*_r0" to anchor the shared
-// "<base>" prefix; per-rank paths are built by appending "_r<rank>" for each
-// rank in [0, Tp*Pp*Pcp*Dcp). _r0 is used purely as the glob anchor — it is
-// the only rank guaranteed to exist whenever any worker has flushed — and
-// the resulting <base> applies to all ranks because every worker shares the
-// same base_path (file_mapper.py:117).
+// Neither the <modelDir> nor <groupIdx> are user-supplied. They are
+// discovered on the first PreRequest by walking RootDir for one known
+// digest's filename. From the matched full path the trailing four segments
+// (`_r<rank>/<hhh>/<hh>_g<groupIdx>/<hash>.bin`) are stripped to yield the
+// rank-shared base prefix; the same prefix applies to every rank because
+// every worker shares it (file_mapper.py:117).
 type KVFilePathBaseParams struct {
 	RootDir          string `json:"rootDir"`
 	ModelName        string `json:"modelName"`
@@ -67,18 +65,20 @@ type KVFilePathBaseParams struct {
 	DcpSize          int    `json:"dcpSize"`
 }
 
-// discoveryCache memoizes the (base, groupIdx) pair resolved from globbing
-// the filesystem once per process. Populated lazily on the first PreRequest
-// and reset by invalidate() when a prefetch open hits os.ErrNotExist (vLLM
-// restarted with new hash inputs).
+// discoveryCache memoizes the (base, groupIdx) pair resolved by walking
+// RootDir once for a known digest filename. Populated lazily on the first
+// PreRequest that has digests to look up, and reset by invalidate() when a
+// prefetch open hits os.ErrNotExist (vLLM restarted with new hash inputs).
 type discoveryCache struct {
 	mu    sync.RWMutex
-	base  string // <rootDir>/<safeModelName>_<12hex>
+	base  string // rank-shared base prefix: <rootDir>/.../<modelDir>
 	group int    // typically 0
 	done  bool
 }
 
-// IsSet returns true if base path can be built.
+// IsSet returns true if base path can be built. RootDir and ModelName
+// are required; the 12-hex base-path digest, rank, and group are
+// auto-discovered.
 func (b *KVFilePathBaseParams) IsSet() bool {
 	return b != nil && b.RootDir != "" && b.ModelName != ""
 }
@@ -102,12 +102,23 @@ func (b *KVFilePathBaseParams) SetDefaults() {
 	}
 }
 
-// discover resolves (base, group) by inspecting the filesystem. Idempotent
-// and safe to call concurrently — only the first caller actually scans
-// (RWMutex with double-check). On failure, returns an error and leaves the
-// cache unset; the caller skips this round and the next PreRequest will
-// retry.
-func (c *discoveryCache) discover(ctx context.Context, params *KVFilePathBaseParams) error {
+// discover resolves (base, group) by:
+//  1. globbing "<rootDir>/<safeModelName>_*_r*" to enumerate candidate
+//     model+rank directories — vLLM's FileMapper writes every shard under
+//     "<rootDir>/<safeModelName>_<12hex>" with safeModelName = the model
+//     id with '/' replaced by '_' (file_mapper.py:_compute_base_path).
+//     The 12-hex digest depends on dtype/kv_cache_groups/sizes that the
+//     router cannot reproduce, so it is auto-detected from the glob.
+//  2. probing each candidate for "<sub1>/<sub2>_g<N>/<digestHex>.bin" to
+//     verify it's the right deployment and learn the group index. The
+//     anchor digest is the first digest of the request, which the caller
+//     just computed from request tokens; if vLLM has written it, the
+//     deployment matches and we cache (base, group). If no candidate has
+//     the file, discovery defers and the next PreRequest retries.
+//
+// Idempotent and safe to call concurrently — only the first caller
+// actually probes (RWMutex with double-check).
+func (c *discoveryCache) discover(ctx context.Context, params *KVFilePathBaseParams, digest []byte) error {
 	c.mu.RLock()
 	if c.done {
 		c.mu.RUnlock()
@@ -121,65 +132,78 @@ func (c *discoveryCache) discover(ctx context.Context, params *KVFilePathBasePar
 		return nil
 	}
 
-	safeModelName := strings.ReplaceAll(params.ModelName, "/", "_")
+	if len(digest) == 0 {
+		return fmt.Errorf("discover: empty digest cannot anchor a probe")
+	}
 
-	// Glob "_r0" directories — rank 0 is guaranteed to exist whenever any
-	// worker has flushed, and every rank shares the same <base> prefix.
-	pattern := filepath.Join(params.RootDir, safeModelName+"_*_r0")
-	matches, err := filepath.Glob(pattern)
+	safeModelName := strings.ReplaceAll(params.ModelName, "/", "_")
+	pattern := filepath.Join(params.RootDir, safeModelName+"_*_r*")
+	candidates, err := filepath.Glob(pattern)
 	if err != nil {
 		return fmt.Errorf("discover: glob %q: %w", pattern, err)
 	}
-	if len(matches) == 0 {
+	if len(candidates) == 0 {
 		return fmt.Errorf("discover: no folder matches %q (has vLLM initialized and written any blocks?)", pattern)
 	}
-	if len(matches) > 1 {
-		return fmt.Errorf("discover: ambiguous — %d folders match %q: %v", len(matches), pattern, matches)
-	}
-	rank0 := matches[0]
 
-	// Find any "<hhh>/<hh>_g<N>" subfolder to learn the group index. We
-	// only need one sample — group_idx is the same for every block in a
-	// given vLLM deployment (single-group simplification, A3a).
-	groupIdx := -1
-	shards, err := os.ReadDir(rank0)
-	if err != nil {
-		return fmt.Errorf("discover: read %q: %w", rank0, err)
+	hashHex := hex.EncodeToString(digest)
+	if len(hashHex) < 5 {
+		return fmt.Errorf("discover: digest hex %q too short for <hhh>/<hh> layout", hashHex)
 	}
-	for _, shard := range shards {
-		if !shard.IsDir() {
+	sub1, sub2 := hashHex[:3], hashHex[3:5]
+	leaf := hashHex + ".bin"
+
+	for _, candidate := range candidates {
+		rankName := filepath.Base(candidate)
+		rankSuffixIdx := strings.LastIndex(rankName, "_r")
+		if rankSuffixIdx < 0 {
 			continue
 		}
-		shardPath := filepath.Join(rank0, shard.Name())
-		groups, err := os.ReadDir(shardPath)
+		if _, err := strconv.Atoi(rankName[rankSuffixIdx+2:]); err != nil {
+			continue
+		}
+
+		// Try every "<sub1>/<sub2>_g<N>" group folder until one contains
+		// the anchor file. Group index is fixed per deployment; we only
+		// need the first matching group folder.
+		shardDir := filepath.Join(candidate, sub1)
+		entries, err := os.ReadDir(shardDir)
 		if err != nil {
 			continue
 		}
-		for _, g := range groups {
-			if !g.IsDir() {
+		for _, entry := range entries {
+			if !entry.IsDir() {
 				continue
 			}
-			if idx := parseGroupSuffix(g.Name()); idx >= 0 {
-				groupIdx = idx
-				break
+			name := entry.Name()
+			// Match "<sub2>_g<N>" — sub2 is the literal first 2 hex chars.
+			if !strings.HasPrefix(name, sub2+"_g") {
+				continue
 			}
-		}
-		if groupIdx >= 0 {
-			break
+			groupIdx := parseGroupSuffix(name)
+			if groupIdx < 0 {
+				continue
+			}
+			anchorPath := filepath.Join(shardDir, name, leaf)
+			if _, err := os.Stat(anchorPath); err != nil {
+				continue
+			}
+
+			rankParent := filepath.Dir(candidate)
+			c.base = filepath.Join(rankParent, rankName[:rankSuffixIdx])
+			c.group = groupIdx
+			c.done = true
+
+			log.FromContext(ctx).Info("prefetch: resolved KV cache base path",
+				"rootDir", params.RootDir, "modelName", params.ModelName,
+				"anchorFile", leaf, "matchedPath", anchorPath,
+				"basePath", c.base, "groupIdx", c.group)
+			return nil
 		}
 	}
-	if groupIdx < 0 {
-		return fmt.Errorf("discover: no \"<hh>_g<N>\" group subfolder found under %q (no blocks written yet?)", rank0)
-	}
 
-	c.base = strings.TrimSuffix(rank0, "_r0")
-	c.group = groupIdx
-	c.done = true
-
-	log.FromContext(ctx).Info("prefetch: resolved KV cache base path",
-		"rootDir", params.RootDir, "modelName", params.ModelName,
-		"basePath", c.base, "groupIdx", c.group)
-	return nil
+	return fmt.Errorf("discover: anchor file %q not found under any candidate matching %q (request blocks not written yet?)",
+		leaf, pattern)
 }
 
 // parseGroupSuffix extracts N from "<prefix>_g<N>". Returns -1 on mismatch.
@@ -207,48 +231,45 @@ func (c *discoveryCache) invalidate() {
 }
 
 // digestToFullPath returns the complete file path for a block-hash digest on
-// the given rank. The first call performs lazy discovery; on discovery
-// failure it logs at V(1) and returns ("", false) so the caller can skip
-// prefetch for this round.
-func (c *discoveryCache) digestToFullPath(ctx context.Context, params *KVFilePathBaseParams, rank int, digest []byte) (string, bool) {
-	if err := c.discover(ctx, params); err != nil {
-		log.FromContext(ctx).V(1).Info("prefetch: discovery deferred", "reason", err.Error())
-		return "", false
-	}
+// the given rank, given an already-discovered (base, group). The caller is
+// responsible for calling discover() with an anchor digest first.
+func (c *discoveryCache) digestToFullPath(rank int, digest []byte) string {
 	c.mu.RLock()
 	base := c.base
 	group := c.group
 	c.mu.RUnlock()
 
 	suffix := digestToFilenamePathSuffix(digest, group)
-	return fmt.Sprintf("%s_r%d/%s", base, rank, filepath.FromSlash(suffix)), true
+	return fmt.Sprintf("%s_r%d/%s", base, rank, filepath.FromSlash(suffix))
 }
 
 // digestsToFilePaths returns the file paths to prefetch for the given
-// block-hash digests on the given rank. Returns nil if discovery hasn't
-// succeeded yet — the caller should skip this round entirely rather than
-// emit partial paths.
+// block-hash digests on the given rank. The first digest is used as the
+// discovery anchor on the first call; once cached, every subsequent path
+// is built directly from the cached prefix. Returns nil if discovery
+// fails — the caller should skip this round entirely rather than emit
+// partial paths.
 func digestsToFilePaths(ctx context.Context, cache *discoveryCache, params *KVFilePathBaseParams, rank int, digests [][]byte) []string {
+	if len(digests) == 0 {
+		return nil
+	}
+	if err := cache.discover(ctx, params, digests[0]); err != nil {
+		log.FromContext(ctx).V(1).Info("prefetch: discovery deferred", "reason", err.Error())
+		return nil
+	}
+
 	n := params.GpuBlocksPerFile
 	if n <= 1 {
 		paths := make([]string, 0, len(digests))
 		for _, d := range digests {
-			p, ok := cache.digestToFullPath(ctx, params, rank, d)
-			if !ok {
-				return nil
-			}
-			paths = append(paths, p)
+			paths = append(paths, cache.digestToFullPath(rank, d))
 		}
 		return paths
 	}
 
 	paths := make([]string, 0, (len(digests)+n-1)/n)
 	for i := n - 1; i < len(digests); i += n {
-		p, ok := cache.digestToFullPath(ctx, params, rank, digests[i])
-		if !ok {
-			return nil
-		}
-		paths = append(paths, p)
+		paths = append(paths, cache.digestToFullPath(rank, digests[i]))
 	}
 	return paths
 }

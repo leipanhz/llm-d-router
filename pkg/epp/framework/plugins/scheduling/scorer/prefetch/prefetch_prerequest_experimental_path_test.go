@@ -18,167 +18,140 @@ package prefetch
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// makeRank0Tree builds a minimal vLLM-style on-disk layout under root:
+// writeAnchorFile builds a vLLM-style on-disk path under root and writes
+// an empty `<digestHex>.bin` file at the leaf, mirroring the layout that
+// FileMapper produces:
 //
-//	<root>/<safeModel>_<digest>_r0/<sub1>/<sub2>_g<groupIdx>/<dummy>.bin
+//	<root>/<safeModelName>_<basePathDigest>_r<rank>/<sub1>/<sub2>_g<groupIdx>/<digestHex>.bin
 //
-// safeModel is modelName with '/' replaced by '_'. Returns the rank0 dir.
-func makeRank0Tree(t *testing.T, root, modelName, digest, sub1, sub2 string, groupIdx int) string {
+// where sub1 = digestHex[:3], sub2 = digestHex[3:5]. Returns the digest
+// bytes used to anchor discovery.
+func writeAnchorFile(t *testing.T, root, safeModelName, basePathDigest string, rank int, groupIdx int, digestHex string) []byte {
 	t.Helper()
-	safe := strings.ReplaceAll(modelName, "/", "_")
-	rank0 := filepath.Join(root, fmt.Sprintf("%s_%s_r0", safe, digest))
-	groupDir := filepath.Join(rank0, sub1, fmt.Sprintf("%s_g%d", sub2, groupIdx))
+	require.GreaterOrEqual(t, len(digestHex), 5, "digest hex must be at least 5 chars")
+	sub1, sub2 := digestHex[:3], digestHex[3:5]
+	rankDir := filepath.Join(root, fmt.Sprintf("%s_%s_r%d", safeModelName, basePathDigest, rank))
+	groupDir := filepath.Join(rankDir, sub1, fmt.Sprintf("%s_g%d", sub2, groupIdx))
 	require.NoError(t, os.MkdirAll(groupDir, 0o755))
-	dummy := filepath.Join(groupDir, "0000000000000000.bin")
-	require.NoError(t, os.WriteFile(dummy, []byte{}, 0o644))
-	return rank0
+	leaf := filepath.Join(groupDir, digestHex+".bin")
+	require.NoError(t, os.WriteFile(leaf, []byte{}, 0o644))
+	d, err := hex.DecodeString(digestHex)
+	require.NoError(t, err)
+	return d
 }
 
-func TestDiscover_SingleMatch(t *testing.T) {
+func TestDiscover_FindsAnchorAndExtractsBaseAndGroup(t *testing.T) {
 	root := t.TempDir()
-	makeRank0Tree(t, root, "meta-llama/Llama-3.1-8B", "abcdef123456", "abc", "de", 0)
+	digest := writeAnchorFile(t, root, "Qwen_Qwen3-8B", "07d7b166f256", 0, 0,
+		"7050ab3d42d0b5e628c4e846e90715c1e1b2ac6247ce88b5e1a944b73c04d5d1")
 
-	params := &KVFilePathBaseParams{
-		RootDir:   root,
-		ModelName: "meta-llama/Llama-3.1-8B",
-	}
+	params := &KVFilePathBaseParams{RootDir: root, ModelName: "Qwen/Qwen3-8B"}
 	cache := &discoveryCache{}
-	require.NoError(t, cache.discover(context.Background(), params))
+	require.NoError(t, cache.discover(context.Background(), params, digest))
 
-	expectedBase := filepath.Join(root, "meta-llama_Llama-3.1-8B_abcdef123456")
+	expectedBase := filepath.Join(root, "Qwen_Qwen3-8B_07d7b166f256")
 	assert.Equal(t, expectedBase, cache.base)
 	assert.Equal(t, 0, cache.group)
 	assert.True(t, cache.done)
 }
 
+func TestDiscover_GroupIdxNonZero(t *testing.T) {
+	root := t.TempDir()
+	digest := writeAnchorFile(t, root, "model", "abcdef123456", 2, 3,
+		"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+
+	params := &KVFilePathBaseParams{RootDir: root, ModelName: "model"}
+	cache := &discoveryCache{}
+	require.NoError(t, cache.discover(context.Background(), params, digest))
+	assert.Equal(t, 3, cache.group)
+	assert.Equal(t, filepath.Join(root, "model_abcdef123456"), cache.base)
+}
+
 func TestDiscover_NoMatch(t *testing.T) {
 	root := t.TempDir()
-	params := &KVFilePathBaseParams{
-		RootDir:   root,
-		ModelName: "no-such-model",
-	}
+	params := &KVFilePathBaseParams{RootDir: root, ModelName: "no-such-model"}
 	cache := &discoveryCache{}
-	err := cache.discover(context.Background(), params)
+	digest := []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00}
+	err := cache.discover(context.Background(), params, digest)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no folder matches")
-	assert.Contains(t, err.Error(), "vLLM initialized")
 	assert.False(t, cache.done)
 }
 
-func TestDiscover_AmbiguousMatch(t *testing.T) {
+func TestDiscover_FolderExistsButAnchorMissing(t *testing.T) {
 	root := t.TempDir()
-	makeRank0Tree(t, root, "model", "aaaaaaaaaaaa", "aaa", "aa", 0)
-	makeRank0Tree(t, root, "model", "bbbbbbbbbbbb", "bbb", "bb", 0)
+	// Folder for the model exists but doesn't contain the anchor digest.
+	otherDigestHex := "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	writeAnchorFile(t, root, "model", "abcdef123456", 0, 0, otherDigestHex)
 
-	params := &KVFilePathBaseParams{
-		RootDir:   root,
-		ModelName: "model",
-	}
+	params := &KVFilePathBaseParams{RootDir: root, ModelName: "model"}
 	cache := &discoveryCache{}
-	err := cache.discover(context.Background(), params)
+	digest := []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00}
+	err := cache.discover(context.Background(), params, digest)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ambiguous")
-	// Both candidates should appear in the message
-	assert.Contains(t, err.Error(), "aaaaaaaaaaaa")
-	assert.Contains(t, err.Error(), "bbbbbbbbbbbb")
+	assert.Contains(t, err.Error(), "anchor file")
+	assert.False(t, cache.done)
 }
 
-func TestDiscover_NoBlocksYet(t *testing.T) {
+func TestDiscover_EmptyDigest(t *testing.T) {
 	root := t.TempDir()
-	// Create the _r0 dir but no group subfolders.
-	rank0 := filepath.Join(root, "model_abcdef123456_r0")
-	require.NoError(t, os.MkdirAll(rank0, 0o755))
-
-	params := &KVFilePathBaseParams{
-		RootDir:   root,
-		ModelName: "model",
-	}
+	params := &KVFilePathBaseParams{RootDir: root, ModelName: "model"}
 	cache := &discoveryCache{}
-	err := cache.discover(context.Background(), params)
+	err := cache.discover(context.Background(), params, nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no \"<hh>_g<N>\" group subfolder found")
-}
-
-func TestDiscover_GroupIdxNonZero(t *testing.T) {
-	root := t.TempDir()
-	makeRank0Tree(t, root, "model", "abcdef123456", "abc", "de", 3)
-
-	params := &KVFilePathBaseParams{
-		RootDir:   root,
-		ModelName: "model",
-	}
-	cache := &discoveryCache{}
-	require.NoError(t, cache.discover(context.Background(), params))
-	assert.Equal(t, 3, cache.group)
+	assert.Contains(t, err.Error(), "empty digest")
 }
 
 func TestDigestToFullPath_FormatsCorrectly(t *testing.T) {
 	root := t.TempDir()
-	makeRank0Tree(t, root, "m", "abc", "abc", "ab", 0)
+	anchor := writeAnchorFile(t, root, "m", "abcdef123456", 0, 0,
+		"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 
-	params := &KVFilePathBaseParams{
-		RootDir:   root,
-		ModelName: "m",
-	}
+	params := &KVFilePathBaseParams{RootDir: root, ModelName: "m"}
 	cache := &discoveryCache{}
-	require.NoError(t, cache.discover(context.Background(), params))
+	require.NoError(t, cache.discover(context.Background(), params, anchor))
 
-	// 8-byte digest 0xdeadbeef00000000 → hex "deadbeef00000000"; sub1="dea", sub2="db"
-	digest := []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00}
-	path, ok := cache.digestToFullPath(context.Background(), params, 2, digest)
-	assert.True(t, ok)
-	expectedBase := filepath.Join(root, "m_abc")
-	expected := fmt.Sprintf("%s_r2/dea/db_g0/deadbeef00000000.bin", expectedBase)
+	// Build a path for a different digest on a different rank using the
+	// cached prefix and group.
+	other := []byte{0x12, 0x34, 0x56, 0x78, 0xaa, 0xbb, 0xcc, 0xdd}
+	path := cache.digestToFullPath(2, other)
+	expected := filepath.Join(root, "m_abcdef123456") + "_r2/123/45_g0/12345678aabbccdd.bin"
 	assert.Equal(t, expected, path)
-}
-
-func TestDigestToFullPath_DiscoveryDefers(t *testing.T) {
-	root := t.TempDir()
-	// No vLLM tree under root → discovery fails.
-	params := &KVFilePathBaseParams{
-		RootDir:   root,
-		ModelName: "no-such-model",
-	}
-	cache := &discoveryCache{}
-	path, ok := cache.digestToFullPath(context.Background(), params, 0, []byte{0x01})
-	assert.False(t, ok)
-	assert.Equal(t, "", path)
 }
 
 func TestInvalidate(t *testing.T) {
 	root := t.TempDir()
-	makeRank0Tree(t, root, "m", "first", "abc", "ab", 0)
+	first := writeAnchorFile(t, root, "m", "firstdigest1", 0, 0,
+		"1111111111111111111111111111111111111111111111111111111111111111")
 
-	params := &KVFilePathBaseParams{
-		RootDir:   root,
-		ModelName: "m",
-	}
+	params := &KVFilePathBaseParams{RootDir: root, ModelName: "m"}
 	cache := &discoveryCache{}
-	require.NoError(t, cache.discover(context.Background(), params))
+	require.NoError(t, cache.discover(context.Background(), params, first))
 	firstBase := cache.base
 
-	// Simulate vLLM restart with new digest: replace the on-disk tree.
-	require.NoError(t, os.RemoveAll(filepath.Join(root, "m_first_r0")))
-	makeRank0Tree(t, root, "m", "second", "def", "ef", 0)
+	// Simulate vLLM restart with new base-path digest: replace the on-disk tree.
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "m_firstdigest1_r0")))
+	second := writeAnchorFile(t, root, "m", "seconddigest", 0, 0,
+		"2222222222222222222222222222222222222222222222222222222222222222")
 
-	// Without invalidate, cache is stale.
-	require.NoError(t, cache.discover(context.Background(), params))
+	// Without invalidate, cache is stale (no probe happens — discover is a no-op).
+	require.NoError(t, cache.discover(context.Background(), params, second))
 	assert.Equal(t, firstBase, cache.base)
 
-	// After invalidate, the next discover picks up the new digest.
+	// After invalidate, the next discover picks up the new base-path digest.
 	cache.invalidate()
-	require.NoError(t, cache.discover(context.Background(), params))
-	assert.Equal(t, filepath.Join(root, "m_second"), cache.base)
+	require.NoError(t, cache.discover(context.Background(), params, second))
+	assert.Equal(t, filepath.Join(root, "m_seconddigest"), cache.base)
 }
 
 func TestParseGroupSuffix(t *testing.T) {
@@ -205,7 +178,9 @@ func TestParseGroupSuffix(t *testing.T) {
 
 func TestDigestsToFilePaths_BatchedByBlocksPerFile(t *testing.T) {
 	root := t.TempDir()
-	makeRank0Tree(t, root, "m", "abc", "abc", "ab", 0)
+	// Anchor digest: the first one in the request triggers discovery.
+	anchorHex := "0000000000000001000000000000000000000000000000000000000000000001"
+	anchor := writeAnchorFile(t, root, "m", "abcdef123456", 0, 0, anchorHex)
 
 	params := &KVFilePathBaseParams{
 		RootDir:          root,
@@ -213,23 +188,22 @@ func TestDigestsToFilePaths_BatchedByBlocksPerFile(t *testing.T) {
 		GpuBlocksPerFile: 4,
 	}
 	cache := &discoveryCache{}
-	digestFor := func(v uint64) []byte {
-		d := make([]byte, 8)
-		for i := 0; i < 8; i++ {
-			d[i] = byte(v >> (8 * (7 - i)))
-		}
+
+	// 8 digests starting with the anchor; the batching loop with
+	// GpuBlocksPerFile=4 picks indices 3 and 7.
+	digestN := func(n byte) []byte {
+		d := make([]byte, 32)
+		d[31] = n
 		return d
 	}
 	digests := [][]byte{
-		digestFor(0x1), digestFor(0x2), digestFor(0x3), digestFor(0x4),
-		digestFor(0x5), digestFor(0x6), digestFor(0x7), digestFor(0x8),
+		anchor, digestN(2), digestN(3), digestN(4),
+		digestN(5), digestN(6), digestN(7), digestN(8),
 	}
 	paths := digestsToFilePaths(context.Background(), cache, params, 0, digests)
 	require.Len(t, paths, 2)
-	// With GpuBlocksPerFile=4, the loop picks indices 3 and 7
-	// (zero-based), i.e. digests 0x4 and 0x8.
-	assert.Contains(t, paths[0], "0000000000000004.bin")
-	assert.Contains(t, paths[1], "0000000000000008.bin")
+	assert.Contains(t, paths[0], hex.EncodeToString(digestN(4))+".bin")
+	assert.Contains(t, paths[1], hex.EncodeToString(digestN(8))+".bin")
 }
 
 func TestDigestsToFilePaths_DiscoveryDefersReturnsNil(t *testing.T) {
@@ -240,6 +214,7 @@ func TestDigestsToFilePaths_DiscoveryDefersReturnsNil(t *testing.T) {
 		GpuBlocksPerFile: 1,
 	}
 	cache := &discoveryCache{}
+	// No model folder under root → glob finds nothing → discover errors → nil result.
 	paths := digestsToFilePaths(context.Background(), cache, params, 0,
 		[][]byte{{0, 0, 0, 0, 0, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 2}})
 	assert.Nil(t, paths)
